@@ -50,7 +50,6 @@ struct usbmix_ctl_map {
 
 /*
  * Topology of SB Extigy (see on the wide screen :)
-
 USB_IN[1] --->FU[2]------------------------------+->MU[16]-->PU[17]-+->FU[18]--+->EU[27]--+->EU[21]-->FU[22]--+->FU[23] > Dig_OUT[24]
                                                  ^                  |          |          |                   |
 USB_IN[3] -+->SU[5]-->FU[6]--+->MU[14] ->PU[15]->+                  |          |          |                   +->FU[25] > Dig_OUT[26]
@@ -136,7 +135,6 @@ static struct usbmix_name_map mp3plus_map[] = {
 };
 
 /* Topology of SB Audigy 2 NX
-
           +----------------------------->EU[27]--+
           |                                      v
           | +----------------------------------->SU[29]---->FU[22]-->Dig_OUT[24]
@@ -336,6 +334,26 @@ static const struct usbmix_name_map scms_usb3318_map[] = {
 	{ 0 }
 };
 
+/* Bose companion 5, the dB conversion factor is 16 instead of 256 */
+static struct usbmix_dB_map bose_companion5_dB = {-5006, -6};
+static struct usbmix_name_map bose_companion5_map[] = {
+	{ 3, NULL, .dB = &bose_companion5_dB },
+	{ 0 }	/* terminator */
+};
+
+/*
+ * Dell usb dock with ALC4020 codec had a firmware problem where it got
+ * screwed up when zero volume is passed; just skip it as a workaround
+ *
+ * Also the extension unit gives an access error, so skip it as well.
+ */
+static const struct usbmix_name_map dell_alc4020_map[] = {
+	{ 4, NULL },	/* extension unit */
+	{ 16, NULL },
+	{ 19, NULL },
+	{ 0 }
+};
+
 /*
  * Control map entries
  */
@@ -419,6 +437,10 @@ static struct usbmix_ctl_map usbmix_ctl_maps[] = {
 		.map = aureon_51_2_map,
 	},
 	{
+		.id = USB_ID(0x0bda, 0x4014),
+		.map = dell_alc4020_map,
+	},
+	{
 		.id = USB_ID(0x13e5, 0x0001),
 		.map = scratch_live_map,
 		.ignore_ctl_error = 1,
@@ -426,6 +448,11 @@ static struct usbmix_ctl_map usbmix_ctl_maps[] = {
 	{
 		.id = USB_ID(0x200c, 0x1018),
 		.map = ebox44_map,
+	},
+	{
+		/* MAYA44 USB+ */
+		.id = USB_ID(0x2573, 0x0008),
+		.map = maya44_map,
 	},
 	{
 		/* KEF X300A */
@@ -436,6 +463,11 @@ static struct usbmix_ctl_map usbmix_ctl_maps[] = {
 		/* Arcam rPAC */
 		.id = USB_ID(0x25c4, 0x0003),
 		.map = scms_usb3318_map,
+	},
+	{
+		/* Bose Companion 5 */
+		.id = USB_ID(0x05a7, 0x1020),
+		.map = bose_companion5_map,
 	},
 	{ 0 } /* terminator */
 };

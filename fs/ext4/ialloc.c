@@ -23,7 +23,6 @@
 #include <linux/bitops.h>
 #include <linux/blkdev.h>
 #include <asm/byteorder.h>
-#include <linux/ratelimit.h>
 
 #include "ext4.h"
 #include "ext4_jbd2.h"
@@ -65,45 +64,6 @@ void ext4_mark_bitmap_end(int start_bit, int end_bit, char *bitmap)
 		memset(bitmap + (i >> 3), 0xff, (end_bit - i) >> 3);
 }
 
-/* Initializes an uninitialized inode bitmap */
-static unsigned ext4_init_inode_bitmap(struct super_block *sb,
-				       struct buffer_head *bh,
-				       ext4_group_t block_group,
-				       struct ext4_group_desc *gdp)
-{
-	struct ext4_group_info *grp;
-	struct ext4_sb_info *sbi = EXT4_SB(sb);
-	J_ASSERT_BH(bh, buffer_locked(bh));
-
-	/* If checksum is bad mark all blocks and inodes use to prevent
-	 * allocation, essentially implementing a per-group read-only flag. */
-	if (!ext4_group_desc_csum_verify(sb, block_group, gdp)) {
-		ext4_error(sb, "Checksum bad for group %u", block_group);
-		grp = ext4_get_group_info(sb, block_group);
-		if (!EXT4_MB_GRP_BBITMAP_CORRUPT(grp))
-			percpu_counter_sub(&sbi->s_freeclusters_counter,
-					   grp->bb_free);
-		set_bit(EXT4_GROUP_INFO_BBITMAP_CORRUPT_BIT, &grp->bb_state);
-		if (!EXT4_MB_GRP_IBITMAP_CORRUPT(grp)) {
-			int count;
-			count = ext4_free_inodes_count(sb, gdp);
-			percpu_counter_sub(&sbi->s_freeinodes_counter,
-					   count);
-		}
-		set_bit(EXT4_GROUP_INFO_IBITMAP_CORRUPT_BIT, &grp->bb_state);
-		return 0;
-	}
-
-	memset(bh->b_data, 0, (EXT4_INODES_PER_GROUP(sb) + 7) / 8);
-	ext4_mark_bitmap_end(EXT4_INODES_PER_GROUP(sb), sb->s_blocksize * 8,
-			bh->b_data);
-	ext4_inode_bitmap_csum_set(sb, block_group, gdp, bh,
-				   EXT4_INODES_PER_GROUP(sb) / 8);
-	ext4_group_desc_csum_set(sb, block_group, gdp);
-
-	return EXT4_INODES_PER_GROUP(sb);
-}
-
 void ext4_end_bitmap_read(struct buffer_head *bh, int uptodate)
 {
 	if (uptodate) {
@@ -124,16 +84,22 @@ static struct buffer_head *
 ext4_read_inode_bitmap(struct super_block *sb, ext4_group_t block_group)
 {
 	struct ext4_group_desc *desc;
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
 	struct buffer_head *bh = NULL;
 	ext4_fsblk_t bitmap_blk;
 	struct ext4_group_info *grp;
-	struct ext4_sb_info *sbi = EXT4_SB(sb);
 
 	desc = ext4_get_group_desc(sb, block_group, NULL);
 	if (!desc)
 		return NULL;
 
 	bitmap_blk = ext4_inode_bitmap(sb, desc);
+	if ((bitmap_blk <= le32_to_cpu(sbi->s_es->s_first_data_block)) ||
+	    (bitmap_blk >= ext4_blocks_count(sbi->s_es))) {
+		ext4_error(sb, "Invalid inode bitmap blk %llu in "
+			   "block_group %u", bitmap_blk, block_group);
+		return ERR_PTR(-EUCLEAN);
+	}
 	bh = sb_getblk(sb, bitmap_blk);
 	if (unlikely(!bh)) {
 		ext4_error(sb, "Cannot read inode bitmap - "
@@ -152,7 +118,7 @@ ext4_read_inode_bitmap(struct super_block *sb, ext4_group_t block_group)
 
 	ext4_lock_group(sb, block_group);
 	if (ext4_has_group_desc_csum(sb) &&
-		(desc->bg_flags & cpu_to_le16(EXT4_BG_INODE_UNINIT))) {
+	    (desc->bg_flags & cpu_to_le16(EXT4_BG_INODE_UNINIT))) {
 		if (block_group == 0) {
 			ext4_unlock_group(sb, block_group);
 			unlock_buffer(bh);
@@ -161,7 +127,9 @@ ext4_read_inode_bitmap(struct super_block *sb, ext4_group_t block_group)
 			put_bh(bh);
 			return NULL;
 		}
-		ext4_init_inode_bitmap(sb, bh, block_group, desc);
+		memset(bh->b_data, 0, (EXT4_INODES_PER_GROUP(sb) + 7) / 8);
+		ext4_mark_bitmap_end(EXT4_INODES_PER_GROUP(sb),
+				     sb->s_blocksize * 8, bh->b_data);
 		set_bitmap_uptodate(bh);
 		set_buffer_uptodate(bh);
 		set_buffer_verified(bh);
@@ -347,9 +315,6 @@ out:
 		if (!fatal)
 			fatal = err;
 	} else {
-		/* for debugging, sangwoo2.lee */
-		print_bh(sb, bitmap_bh, 0, EXT4_BLOCK_SIZE(sb));
-		/* for debugging */
 		ext4_error(sb, "bit already cleared for inode %lu", ino);
 		if (gdp && !EXT4_MB_GRP_IBITMAP_CORRUPT(grp)) {
 			int count;
@@ -711,34 +676,6 @@ out:
 	return ret;
 }
 
-/**
- * ext4_has_free_inodes()
- * @sbi: in-core super block structure.
- *
- * Check if filesystem has inodes available for allocation.
- * On success return 1, return 0 on failure.
- */
-static inline int ext4_has_free_inodes(struct ext4_sb_info *sbi)
-{
-	if (likely(percpu_counter_read_positive(&sbi->s_freeinodes_counter) >
-			sbi->s_r_inodes_count * 2))
-		return 1;
-
-#if ANDROID_VERSION < 90000
-	if (percpu_counter_read_positive(&sbi->s_freeinodes_counter) >
-			sbi->s_r_inodes_count &&
-			in_group_p(AID_USE_SEC_RESERVED))
-		return 1;
-#endif
-
-	/* Hm, nope.  Are (enough) root reserved inodes available? */
-	if (uid_eq(sbi->s_resuid, current_fsuid()) ||
-	    (!gid_eq(sbi->s_resgid, GLOBAL_ROOT_GID) && in_group_p(sbi->s_resgid)) ||
-	    capable(CAP_SYS_RESOURCE) || ext4_android_claim_r_blocks(sbi))
-		return 1;
-	return 0;
-}
-
 /*
  * There are two policies for allocating an inode.  If the new inode is
  * a directory, then a forward search is made for a block group with both
@@ -812,11 +749,6 @@ struct inode *__ext4_new_inode(handle_t *handle, struct inode *dir,
 	} else
 		inode_init_owner(inode, dir, mode);
 	dquot_initialize(inode);
-
-	if (!ext4_has_free_inodes(sbi)) {
-		err = -ENOSPC;
-		goto out;
-	}
 
 	if (!goal)
 		goal = sbi->s_inode_goal;
@@ -965,7 +897,7 @@ got:
 		/* recheck and clear flag under lock if we still need to */
 		ext4_lock_group(sb, group);
 		if (ext4_has_group_desc_csum(sb) &&
-			(gdp->bg_flags & cpu_to_le16(EXT4_BG_BLOCK_UNINIT))) {
+		    (gdp->bg_flags & cpu_to_le16(EXT4_BG_BLOCK_UNINIT))) {
 			gdp->bg_flags &= cpu_to_le16(~EXT4_BG_BLOCK_UNINIT);
 			ext4_free_group_clusters_set(sb, gdp,
 				ext4_free_clusters_after_init(sb, group, gdp));
@@ -1142,11 +1074,6 @@ fail_drop:
 	clear_nlink(inode);
 	unlock_new_inode(inode);
 out:
-	if (err == -ENOSPC) {
-		printk_ratelimited(KERN_INFO "Return ENOSPC: ifree=%d, inodes=%u\n",
-			(int) percpu_counter_read_positive(&sbi->s_freeinodes_counter),
-			le32_to_cpu(sbi->s_es->s_inodes_count));
-	}
 	dquot_drop(inode);
 	inode->i_flags |= S_NOQUOTA;
 	iput(inode);
